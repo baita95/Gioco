@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Salta e Centra</title>
+<style>
+  :root {
+    --sky-top:#bfe9f5; --sky-bot:#eaf7fb;
+    --tank-frame:#2b6f7a;
+    --ink:#10333a;
+    --gold:#e8b23d;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body{ margin:0;padding:0;height:100%;overflow:hidden;
+    background:linear-gradient(180deg,var(--sky-top),var(--sky-bot));
+    font-family:-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--ink);
+    touch-action:none; user-select:none; }
+  #app{ height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; position:relative; }
+  #hud{ position:absolute; top:0; left:0; right:0; display:flex; justify-content:space-between; padding:14px 18px; z-index:5; }
+  #hud .box{ text-align:center; }
+  #hud .label{ font-size:10px; letter-spacing:.14em; text-transform:uppercase; color:#3d7783; }
+  #hud .value{ font-size:20px; font-weight:800; }
+  canvas{ display:block; border-radius:14px;
+    box-shadow:0 0 0 6px var(--tank-frame), 0 18px 40px rgba(10,50,60,.25);
+    touch-action:none; }
+  #hint{ margin-top:12px; font-size:12px; color:#3d7783; }
+  #debug{ position:absolute; bottom:8px; left:8px; right:8px; z-index:6;
+    font-size:11px; line-height:1.5; color:#0a4a56; background:rgba(255,255,255,0.75);
+    border-radius:8px; padding:8px 10px; font-family:monospace; }
+  #overlay{ position:absolute; inset:0; background:rgba(20,60,70,.92);
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    z-index:10; text-align:center; padding:32px; color:#eaf7fb; }
+  #overlay h1{ font-size:26px; margin:0 0 8px; color:var(--gold); }
+  #overlay p{ max-width:300px; line-height:1.5; font-size:14px; color:#cfeaf1; margin:0 0 24px; }
+  #overlay button{ background:var(--gold); color:#3a2a06; border:none; padding:14px 30px;
+    border-radius:30px; font-size:15px; font-weight:800; }
+  .hidden{ display:none !important; }
+  #win{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    background:rgba(20,60,70,.75); z-index:8; flex-direction:column; color:var(--gold); }
+  #win h2{ font-size:24px; margin:0 0 14px; text-align:center; padding:0 20px; }
+  #win button{ background:var(--gold); color:#3a2a06; border:none; padding:12px 26px; border-radius:26px; font-weight:800; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="hud">
+    <div class="box"><div class="label">Livello</div><div class="value" id="lvlNum">1</div></div>
+    <div class="box"><div class="label">Agganciati</div><div class="value" id="score">0/3</div></div>
+    <div class="box"><div class="label">Tempo</div><div class="value" id="timer">0.0s</div></div>
+  </div>
+
+  <canvas id="game" width="340" height="520"></canvas>
+  <div id="hint">Tocca lo schermo per far saltare l'anello • inclina per guidarlo</div>
+  <div id="debug">Sensore: in attesa...</div>
+
+  <div id="overlay">
+    <h1>Salta e Centra</h1>
+    <p>Tocca lo schermo per far saltare l'anello colorato fuori dall'acqua. Inclina il telefono per guidarlo a mezz'aria e centralo sul bastoncino dello stesso colore, evitando gli altri.</p>
+    <button id="startBtn">Inizia</button>
+  </div>
+
+  <div id="win" class="hidden">
+    <h2 id="winText">Livello completato!</h2>
+    <button id="nextBtn">Livello successivo</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const overlay = document.getElementById('overlay');
+  const startBtn = document.getElementById('startBtn');
+  const winPanel = document.getElementById('win');
+  const winText = document.getElementById('winText');
+  const nextBtn = document.getElementById('nextBtn');
+  const lvlNumEl = document.getElementById('lvlNum');
+  const scoreEl = document.getElementById('score');
+  const timerEl = document.getElementById('timer');
+  const debugEl = document.getElementById('debug');
+
+  let orientEventCount = 0;
+  let permissionState = 'non richiesto';
+
+  function updateDebug(gamma, beta){
+    const secure = window.isSecureContext ? 'SI' : 'NO (blocca i sensori!)';
+    debugEl.innerHTML =
+      'protocollo: ' + location.protocol + ' | contesto sicuro: ' + secure + '<br>' +
+      'permesso: ' + permissionState + ' | eventi ricevuti: ' + orientEventCount + '<br>' +
+      (orientEventCount>0 ? ('gamma: '+(gamma!==undefined?gamma.toFixed(1):'-')+' beta: '+(beta!==undefined?beta.toFixed(1):'-'))
+        : (orientEventCount===0 && permissionState!=='non richiesto' ? 'Nessun dato dal sensore ricevuto finora' : ''));
+  }
+  updateDebug();
+
+  const WATER_Y = H - 60;      // resting water surface
+  const RING_R = 14;
+  const GRAVITY = 900;
+  const JUMP_V = -430;
+  const JUMP_V_MAX = -520;     // cap for repeated taps
+  const TILT_ACCEL = 620;
+  const VX_DAMP = 0.985;
+  const WALL_MARGIN = 20;
+
+  // Level definitions: pegs with x (fraction of width), height fraction of tank, color
+  const levelDefs = [
+    { pegs: [
+        {xf:0.28, hf:0.42, color:'#e8574a'},
+        {xf:0.72, hf:0.58, color:'#f2b134'},
+        {xf:0.50, hf:0.80, color:'#4aa96c'}
+      ] },
+    { pegs: [
+        {xf:0.20, hf:0.35, color:'#e8574a'},
+        {xf:0.50, hf:0.55, color:'#f2b134'},
+        {xf:0.80, hf:0.40, color:'#4aa96c'},
+        {xf:0.50, hf:0.82, color:'#3f8ecf'}
+      ] },
+    { pegs: [
+        {xf:0.18, hf:0.30, color:'#e8574a'},
+        {xf:0.40, hf:0.50, color:'#f2b134'},
+        {xf:0.62, hf:0.34, color:'#4aa96c'},
+        {xf:0.82, hf:0.58, color:'#3f8ecf'},
+        {xf:0.50, hf:0.85, color:'#a06bd6'}
+      ] }
+  ];
+
+  let levelIndex = 0;
+  let pegs = [];
+  let ring = null;
+  let tiltX = 0; // -1..1
+  let running = false, lastTime = 0, elapsed = 0;
+  let usingOrientation = false;
+
+  function makePegs(i){
+    const def = levelDefs[i % levelDefs.length];
+    return def.pegs.map(p=>({
+      x: WALL_MARGIN + p.xf*(W-2*WALL_MARGIN),
+      topY: WATER_Y - p.hf*(WATER_Y-30),
+      color: p.color,
+      caught: false
+    }));
+  }
+
+  function nextActiveIndex(){
+    return pegs.findIndex(p=>!p.caught);
+  }
+
+  function spawnRing(){
+    const idx = nextActiveIndex();
+    if (idx === -1){ ring = null; return; }
+    const target = pegs[idx];
+    ring = {
+      x: W/2, y: WATER_Y, vx:0, vy:0,
+      airborne:false, color: target.color, targetIdx: idx
+    };
+  }
+
+  function loadLevel(i){
+    pegs = makePegs(i);
+    elapsed = 0;
+    lvlNumEl.textContent = (i+1);
+    scoreEl.textContent = '0/' + pegs.length;
+    spawnRing();
+    winPanel.classList.add('hidden');
+  }
+
+  function doJump(){
+    if (!ring) return;
+    if (!ring.airborne){
+      ring.airborne = true;
+      ring.vy = JUMP_V;
+    } else {
+      // extra tap boosts upward, capped
+      ring.vy = Math.max(JUMP_V_MAX, ring.vy - 260);
+    }
+  }
+
+  function update(dt){
+    if (!ring){ return; }
+
+    // horizontal control from tilt (always active)
+    ring.vx += tiltX * TILT_ACCEL * dt;
+    ring.vx *= VX_DAMP;
+    ring.x += ring.vx * dt;
+
+    // wall bounce
+    if (ring.x < WALL_MARGIN){ ring.x = WALL_MARGIN; ring.vx *= -0.5; }
+    if (ring.x > W-WALL_MARGIN){ ring.x = W-WALL_MARGIN; ring.vx *= -0.5; }
+
+    if (ring.airborne){
+      ring.vy += GRAVITY*dt;
+      ring.y += ring.vy*dt;
+
+      // collisions with peg rods (only non-target pegs act as obstacles)
+      pegs.forEach((p, idx)=>{
+        if (p.caught) return;
+        if (idx === ring.targetIdx){
+          // catch check near the cap
+          const dx = ring.x - p.x, dy = ring.y - p.topY;
+          if (Math.hypot(dx,dy) < RING_R+8){
+            p.caught = true;
+            spawnRing();
+          }
+          return;
+        }
+        // obstacle rod: vertical segment from p.topY to WATER_Y at p.x
+        if (ring.y > p.topY - 6 && ring.y < WATER_Y){
+          const dx = ring.x - p.x;
+          if (Math.abs(dx) < RING_R+4){
+            ring.x = p.x + Math.sign(dx||1)*(RING_R+4);
+            ring.vx *= -0.6;
+          }
+        }
+      });
+
+      // landed back in water
+      if (ring.y >= WATER_Y){
+        ring.y = WATER_Y;
+        ring.vy = 0;
+        ring.airborne = false;
+      }
+    }
+
+    const caughtCount = pegs.filter(p=>p.caught).length;
+    scoreEl.textContent = caughtCount + '/' + pegs.length;
+    if (caughtCount === pegs.length){
+      running = false;
+      winText.textContent = 'Livello ' + (levelIndex+1) + ' completato in ' + elapsed.toFixed(1) + 's!';
+      winPanel.classList.remove('hidden');
+      return;
+    }
+    elapsed += dt;
+    timerEl.textContent = elapsed.toFixed(1)+'s';
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle = '#eaf7fb';
+    ctx.fillRect(0,0,W,H);
+
+    // water
+    const grad = ctx.createLinearGradient(0,WATER_Y,0,H);
+    grad.addColorStop(0,'#6fd4ea');
+    grad.addColorStop(1,'#1a8fb0');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0,WATER_Y,W,H-WATER_Y);
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let x=0;x<=W;x+=8){
+      const y = WATER_Y + Math.sin((x*0.06)+elapsed*4)*2.5;
+      if (x===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+
+    // pegs
+    pegs.forEach(p=>{
+      ctx.strokeStyle = p.caught ? '#c9c2ae' : '#c9c2ae';
+      ctx.lineWidth = 5; ctx.lineCap='round';
+      ctx.beginPath(); ctx.moveTo(p.x, WATER_Y); ctx.lineTo(p.x, p.topY); ctx.stroke();
+      ctx.fillStyle = p.color;
+      ctx.globalAlpha = p.caught ? 1 : 0.55;
+      ctx.beginPath(); ctx.arc(p.x, p.topY, 7, 0, Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle='rgba(0,0,0,0.25)'; ctx.lineWidth=1.5; ctx.stroke();
+    });
+
+    // caught rings sit on their pegs
+    pegs.forEach(p=>{
+      if (!p.caught) return;
+      ctx.beginPath(); ctx.arc(p.x, p.topY, 15, 0, Math.PI*2);
+      ctx.lineWidth = 7; ctx.strokeStyle = p.color; ctx.stroke();
+      ctx.lineWidth = 1; ctx.strokeStyle='rgba(255,255,255,0.7)'; ctx.stroke();
+    });
+
+    // active ring
+    if (ring){
+      ctx.beginPath(); ctx.arc(ring.x, ring.y, RING_R, 0, Math.PI*2);
+      ctx.lineWidth = 7; ctx.strokeStyle = ring.color; ctx.stroke();
+      ctx.lineWidth = 1; ctx.strokeStyle='rgba(255,255,255,0.8)'; ctx.stroke();
+    }
+
+    ctx.strokeStyle='rgba(20,60,70,0.15)'; ctx.lineWidth=3;
+    ctx.strokeRect(1.5,1.5,W-3,H-3);
+  }
+
+  function loop(ts){
+    if (!lastTime) lastTime = ts;
+    const dt = Math.min(0.032,(ts-lastTime)/1000);
+    lastTime = ts;
+    if (running) update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  function handleOrientation(e){
+    orientEventCount++;
+    const rawGamma = e.gamma||0, rawBeta = e.beta||0;
+    const gamma = Math.max(-30, Math.min(30, rawGamma)) / 30;
+    tiltX = gamma;
+    updateDebug(rawGamma, rawBeta);
+  }
+
+  // fallback: drag horizontally with pointer if no orientation
+  let dragActive = false, dragLastX = null;
+  canvas.addEventListener('pointerdown', (e)=>{
+    doJump();
+    if (!usingOrientation){ dragActive = true; dragLastX = e.clientX; }
+  });
+  window.addEventListener('pointermove', (e)=>{
+    if (usingOrientation || !dragActive) return;
+    const dx = e.clientX - dragLastX;
+    tiltX = Math.max(-1, Math.min(1, dx/40));
+    dragLastX = e.clientX;
+  });
+  window.addEventListener('pointerup', ()=>{
+    dragActive = false;
+    if (!usingOrientation) tiltX = 0;
+  });
+
+  startBtn.addEventListener('click', async ()=>{
+    if (!window.isSecureContext){
+      permissionState = 'BLOCCATO: pagina non su HTTPS';
+      updateDebug();
+    } else if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function'){
+      try{
+        const res = await DeviceOrientationEvent.requestPermission();
+        permissionState = res;
+        if (res === 'granted'){
+          usingOrientation = true;
+          window.addEventListener('deviceorientation', handleOrientation);
+        }
+      } catch(err){
+        permissionState = 'errore: ' + err.message;
+      }
+    } else if ('DeviceOrientationEvent' in window){
+      permissionState = 'auto (non serve richiesta)';
+      usingOrientation = true;
+      window.addEventListener('deviceorientation', handleOrientation);
+    } else {
+      permissionState = 'API non disponibile su questo browser';
+    }
+    updateDebug();
+    overlay.classList.add('hidden');
+    running = true; lastTime = 0;
+  });
+
+  nextBtn.addEventListener('click', ()=>{
+    levelIndex++;
+    loadLevel(levelIndex);
+    running = true; lastTime = 0;
+  });
+
+  loadLevel(0);
+  draw();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
